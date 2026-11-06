@@ -11,3 +11,4 @@ credentials.json
 session.json
 .claude/*
 !.claude/memory/
+.idea/
