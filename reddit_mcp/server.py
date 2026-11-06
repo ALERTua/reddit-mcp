@@ -4,6 +4,7 @@
 Copyright (C) 2026 Iris Thomas. Released under the Unlicense.
 """
 
+import asyncio
 import json
 import logging
 from typing import Any
@@ -26,7 +27,10 @@ async def list_tools() -> list[Tool]:
     return [
         Tool(
             name="reddit_read",
-            description="Read a Reddit post with comments. Returns post content, metadata, and threaded comments.",
+            description=(
+                "Read a Reddit post with its full comment tree. Returns post content, metadata, "
+                "threaded comments, and comments_info, which tells if the tree is partial and why."
+            ),
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -36,16 +40,53 @@ async def list_tools() -> list[Tool]:
                     },
                     "depth": {
                         "type": "integer",
-                        "description": "How many levels of comment replies to include (default: 1)",
-                        "default": 1
+                        "description": "How many levels of comment replies to include (default: all)"
                     },
                     "max_comments": {
                         "type": "integer",
-                        "description": "Maximum number of comments to return (default: 25)",
-                        "default": 25
+                        "description": "Maximum number of comments to return (default: all)"
                     }
                 },
                 "required": ["url"]
+            }
+        ),
+        Tool(
+            name="reddit_thread_search",
+            description=(
+                "Search the comments of one Reddit thread. Loads the full comment tree once and returns "
+                "the matching comments with their id, author, score, depth, an excerpt, and the path of parent ids."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "url": {
+                        "type": "string",
+                        "description": "Post URL or post ID"
+                    },
+                    "query": {
+                        "type": "string",
+                        "description": "Text to find in the comment body (case-insensitive)"
+                    },
+                    "author": {
+                        "type": "string",
+                        "description": "Only comments of this author"
+                    },
+                    "min_score": {
+                        "type": "integer",
+                        "description": "Only comments with at least this score"
+                    },
+                    "max_results": {
+                        "type": "integer",
+                        "description": "Maximum matches to return (default: 25)",
+                        "default": 25
+                    },
+                    "regex": {
+                        "type": "boolean",
+                        "description": "Treat query as a regular expression (default: false)",
+                        "default": False
+                    }
+                },
+                "required": ["url", "query"]
             }
         ),
         Tool(
@@ -225,11 +266,24 @@ async def list_tools() -> list[Tool]:
 
 async def _dispatch_tool(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
     """Execute a Reddit tool and return the dictionary result."""
+    # A thread read can wait between requests, so it runs in a thread of its own
     if name == "reddit_read":
-        return client.read_post(
+        return await asyncio.to_thread(
+            client.read_post,
             arguments["url"],
-            depth=arguments.get("depth", 1),
-            max_comments=arguments.get("max_comments", 25)
+            depth=arguments.get("depth"),
+            max_comments=arguments.get("max_comments")
+        )
+
+    elif name == "reddit_thread_search":
+        return await asyncio.to_thread(
+            client.thread_search,
+            arguments["url"],
+            arguments["query"],
+            author=arguments.get("author"),
+            min_score=arguments.get("min_score"),
+            max_results=arguments.get("max_results", 25),
+            regex=arguments.get("regex", False)
         )
 
     elif name == "reddit_listing":
@@ -289,7 +343,8 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
     """Execute a Reddit tool."""
     try:
         result = await _dispatch_tool(name, arguments)
-        return [TextContent(type="text", text=json.dumps(result, indent=2))]
+        # Compact JSON: a full comment tree is large, and MCP clients cut long answers
+        return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False, separators=(",", ":")))]
     except Exception as e:
         logger.exception(f"Error in {name}")
         return [TextContent(
@@ -325,7 +380,6 @@ async def _run():
 
 def main():
     """Entry point for the MCP server."""
-    import asyncio
     asyncio.run(_run())
 
 

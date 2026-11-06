@@ -7,6 +7,7 @@ Reddit no longer issues API keys, so this uses browser-style authentication.
 Copyright (C) 2026 Iris Thomas. Released under the Unlicense.
 """
 
+import html
 import json
 import os
 import re
@@ -36,6 +37,57 @@ HEADERS = {
     "Origin": "https://old.reddit.com",
     "Referer": "https://old.reddit.com/",
 }
+
+# Limits for reading a thread: Reddit hides part of a large thread behind "more"
+# stubs, and each stub costs one more request to expand.
+THREAD_LIMIT = 500              # comments that Reddit sends in the first page
+MORE_BATCH = 100                # comment ids per /api/morechildren request
+MAX_THREAD_REQUESTS = 30        # hard cap on requests for one thread, retries included
+REQUEST_DELAY = 1.0             # seconds between the requests of one thread
+RETRY_DELAYS = (2.0, 4.0, 8.0)  # backoff after HTTP 429, 5xx or a network error
+RETRY_STATUSES = (429, 500, 502, 503, 504)
+# Reddit allows about 100 requests per 10 minutes for a session and tells the
+# rest in the x-ratelimit-* headers. A thread read keeps a reserve for other tools.
+RATE_RESERVE = 10               # stop expanding a thread below this many requests left
+MAX_RATE_WAIT = 20.0            # wait for a rate limit reset only when it is this close
+
+
+def _html_thing_to_json(thing: dict) -> dict:
+    """Convert a thing from /api/morechildren to the shape of the thread .json.
+
+    With cookie auth, Reddit answers /api/morechildren only with rendered HTML:
+    data has "id", "parent", "contentText" (the markdown source) and "content"
+    (the HTML of the comment). The .json variant of the endpoint answers HTTP 403.
+    """
+    d = thing.get("data", {})
+    if "content" not in d:
+        return thing
+    content = html.unescape(d.get("content", ""))
+    if thing.get("kind") == "more":
+        ids = re.search(r"morechildren\(this, '[^']*', '[^']*', '([^']*)'", content)
+        children = [i for i in ids.group(1).split(",") if i] if ids else []
+        return {"kind": "more", "data": {"parent_id": d.get("parent"), "children": children,
+                                         "count": len(children)}}
+
+    author = re.search(r'data-author="([^"]+)"', content)
+    score = re.search(r'class="score unvoted" title="(-?\d+)"', content)
+    created = re.search(r'<time[^>]* datetime="([^"]+)"', content)
+    body = d.get("contentText", "")
+
+    # The markdown source names an embedded image by its media id only; put the URL back
+    def image_url(m):
+        href = re.search(r'href="([^"]*%s[^"]*)"' % re.escape(m.group(1)), content)
+        return href.group(1) if href else m.group(0)
+
+    body = re.sub(r"!\[(?:img|gif)\]\(([A-Za-z0-9]+)\)", image_url, body)
+    return {"kind": "t1", "data": {
+        "name": d.get("id"),
+        "parent_id": d.get("parent"),
+        "author": author.group(1) if author else "[deleted]",
+        "body": body,
+        "score": int(score.group(1)) if score else None,
+        "created_utc": datetime.fromisoformat(created.group(1)).timestamp() if created else None,
+    }}
 
 
 def save_session(cookies: dict, username: str, browser: str | None = None):
@@ -153,26 +205,68 @@ class RedditClient:
 
         return url
 
-    def read_post(self, url: str, depth: int = 1, max_comments: int = 25) -> dict:
-        """Read a Reddit post with comments.
+    def _request(self, method: str, url: str, counter: dict, **kwargs) -> httpx.Response:
+        """Send one request with a retry and backoff on HTTP 429, 5xx or a network error.
+
+        Each attempt adds one to counter["requests"], so the caller can enforce its cap.
+        The rate limit headers of the last answer go to counter["rate_remaining"] and
+        counter["rate_reset"].
+        """
+        for attempt, delay in enumerate((0.0, *RETRY_DELAYS)):
+            if delay:
+                time.sleep(delay)
+            counter["requests"] += 1
+            try:
+                resp = self.session.request(method, url, **kwargs)
+            except httpx.TransportError:
+                if attempt == len(RETRY_DELAYS) or counter["requests"] >= MAX_THREAD_REQUESTS:
+                    raise
+                continue
+            try:
+                counter["rate_remaining"] = float(resp.headers["x-ratelimit-remaining"])
+                counter["rate_reset"] = float(resp.headers["x-ratelimit-reset"])
+            except (KeyError, ValueError):
+                pass
+            if resp.status_code not in RETRY_STATUSES or counter["requests"] >= MAX_THREAD_REQUESTS:
+                return resp
+            if resp.status_code == 429:
+                reset = counter.get("rate_reset", 0.0)
+                if reset > MAX_RATE_WAIT:
+                    return resp
+                time.sleep(reset)
+        return resp
+
+    def read_post(self, url: str, depth: Optional[int] = None,
+                  max_comments: Optional[int] = None) -> dict:
+        """Read a Reddit post with its full comment tree.
+
+        Reddit sends at most THREAD_LIMIT comments in the first page and hides the
+        rest behind "more" stubs. This method expands each stub with
+        /api/morechildren, or with the permalink of the parent comment for a
+        "continue this thread" stub, until the tree is complete or the request cap
+        is reached. The "comments_info" field tells if the tree is partial and why.
 
         Args:
             url: Post URL or ID
-            depth: How many levels of comment replies to show
-            max_comments: Maximum comments to return
+            depth: How many levels of comment replies to return (None: all)
+            max_comments: Maximum comments to return (None: all)
 
         Returns:
-            Dict with post data and comments
+            Dict with post data, comments and comments_info
         """
         url = self._normalize_url(url)
 
-        # Strip query params and add .json
+        # Strip query params and the .json suffix
         url = url.split('?')[0].rstrip('/')
-        if not url.endswith('.json'):
-            url += '.json'
+        url = url.removesuffix('.json')
 
         self._ensure_logged_in()
-        resp = self.session.get(url)
+        counter = {"requests": 0}
+        params = {"limit": THREAD_LIMIT, "raw_json": 1}
+        resp = self._request("GET", f"{url}.json", counter, params=params)
+        if resp.status_code == 429:
+            return {"success": False, "error": f"HTTP 429: Reddit rate limit, "
+                                               f"it resets in {counter.get('rate_reset', 0):.0f} s"}
         if resp.status_code != 200:
             return {"success": False, "error": f"HTTP {resp.status_code}"}
 
@@ -197,47 +291,248 @@ class RedditClient:
             "created_utc": post_data.get('created_utc'),
             "num_comments": post_data.get('num_comments'),
             "permalink": post_data.get('permalink'),
+            "flair": post_data.get('link_flair_text'),
         }
+        link_id = post["id"]
+        sort = post_data.get('suggested_sort') or "confidence"
 
-        # Extract comments recursively
-        def extract_comments(children, current_depth=1):
-            comments = []
+        top: list = []
+        nodes: dict = {}   # comment fullname -> comment dict
+        stubs: list = []   # "more" stubs that are not expanded yet
+
+        def add_children(children, parent_id):
+            """Put Reddit things into the tree under parent_id. Return the ones whose parent is unknown."""
+            orphans = []
             for child in children:
-                if child.get('kind') != 't1':
+                c = child.get('data', {})
+                pid = c.get('parent_id', parent_id)
+                if child.get('kind') == 'more':
+                    stubs.append(c)
                     continue
-                c = child['data']
-                if c.get('author') in (None, '[deleted]'):
+                if child.get('kind') != 't1' or not c.get('name') or c['name'] in nodes:
                     continue
-
-                comment = {
+                if pid == link_id:
+                    siblings, level = top, 1
+                elif pid in nodes:
+                    siblings, level = nodes[pid]['replies'], nodes[pid]['depth'] + 1
+                else:
+                    orphans.append(child)
+                    continue
+                node = {
                     "id": c.get('name'),
+                    "parent_id": pid,
                     "author": c.get('author'),
                     "body": c.get('body'),
                     "score": c.get('score'),
                     "created_utc": c.get('created_utc'),
-                    "depth": current_depth,
+                    "depth": level,
                     "replies": [],
                 }
-
-                # Get replies if within depth limit
-                if current_depth < depth:
-                    replies = c.get('replies')
-                    if replies and isinstance(replies, dict):
-                        reply_children = replies.get('data', {}).get('children', [])
-                        comment['replies'] = extract_comments(reply_children, current_depth + 1)
-
-                comments.append(comment)
-                if len(comments) >= max_comments:
-                    break
-            return comments
+                nodes[node["id"]] = node
+                siblings.append(node)
+                replies = c.get('replies')
+                if replies and isinstance(replies, dict):
+                    orphans += add_children(replies.get('data', {}).get('children', []), node["id"])
+            return orphans
 
         comment_children = data[1]['data']['children'] if len(data) > 1 else []
-        comments = extract_comments(comment_children)
+        add_children(comment_children, link_id)
+
+        # Expand the "more" stubs
+        errors = []
+        retried: set = set()  # ids that were asked for a second time
+        hidden: list = []     # ids that did not come back twice
+        waiting: list = []    # comments whose parent did not come yet
+        while stubs and (max_comments is None or len(nodes) < max_comments):
+            if counter["requests"] >= MAX_THREAD_REQUESTS:
+                break
+            if counter.get("rate_remaining", RATE_RESERVE) < RATE_RESERVE:
+                errors.append(f"Reddit rate limit: {counter['rate_remaining']:.0f} requests left, "
+                              f"the limit resets in {counter['rate_reset']:.0f} s")
+                break
+            stub = stubs.pop(0)
+            if not stub.get('children') and stub.get('parent_id') not in nodes:
+                errors.append(f"a 'continue this thread' stub under {stub.get('parent_id')} has no loaded parent")
+                continue
+            time.sleep(REQUEST_DELAY)
+            if stub.get('children'):
+                # Batch the ids of this stub with the ids of the next stubs
+                ids = list(stub['children'])
+                while stubs and stubs[0].get('children') and len(ids) + len(stubs[0]['children']) <= MORE_BATCH:
+                    ids += stubs.pop(0)['children']
+                rest = ids[MORE_BATCH:]
+                if rest:
+                    stubs.insert(0, {**stub, "children": rest, "count": len(rest)})
+                    ids = ids[:MORE_BATCH]
+                resp = self._request("POST", f"{BASE_URL}/api/morechildren", counter, data={
+                    "api_type": "json",
+                    "link_id": link_id,
+                    "children": ",".join(ids),
+                    "limit_children": "false",
+                    "sort": sort,
+                    "raw_json": 1,
+                })
+                try:
+                    things = resp.json()["json"]["data"]["things"] if resp.status_code == 200 else None
+                except (json.JSONDecodeError, KeyError, TypeError):
+                    things = None
+                if things is None:
+                    errors.append(f"/api/morechildren answered HTTP {resp.status_code}")
+                    continue
+                things = [_html_thing_to_json(t) for t in things]
+                # Reddit cuts a long answer and does not always list the cut ids in a new
+                # stub. Ask once more for each such id. An id that does not come back
+                # twice is a comment that Reddit does not show.
+                seen = {t["data"].get("name") for t in things}
+                seen |= {f"t1_{i}" for t in things if t["kind"] == "more" for i in t["data"]["children"]}
+                lost = [i for i in ids if f"t1_{i}" not in seen and f"t1_{i}" not in nodes]
+                hidden += [i for i in lost if i in retried]
+                lost = [i for i in lost if i not in retried]
+                if lost:
+                    retried.update(lost)
+                    stubs.append({"parent_id": stub.get("parent_id"), "children": lost, "count": len(lost)})
+                # Things come in tree order, but keep the ones whose parent comes later
+                pending = waiting + things
+                while pending:
+                    left = add_children(pending, link_id)
+                    if len(left) == len(pending):
+                        break
+                    pending = left
+                waiting = pending
+            else:
+                # "Continue this thread": read the permalink of the parent comment
+                parent_id = stub['parent_id']
+                resp = self._request("GET", f"{url}/{parent_id.removeprefix('t1_')}.json",
+                                     counter, params=params)
+                try:
+                    sub = resp.json()[1]['data']['children'] if resp.status_code == 200 else None
+                except (json.JSONDecodeError, KeyError, IndexError, TypeError):
+                    sub = None
+                if not sub:
+                    errors.append(f"comment permalink answered HTTP {resp.status_code}")
+                    continue
+                replies = sub[0].get('data', {}).get('replies')
+                if replies and isinstance(replies, dict):
+                    add_children(replies.get('data', {}).get('children', []), parent_id)
+
+        # Cut the tree to depth and max_comments, in reading order
+        returned = 0
+
+        def trim(comments):
+            nonlocal returned
+            out = []
+            for c in comments:
+                if max_comments is not None and returned >= max_comments:
+                    break
+                returned += 1
+                kept = {**c, "replies": []}
+                if depth is None or c["depth"] < depth:
+                    kept["replies"] = trim(c["replies"])
+                out.append(kept)
+            return out
+
+        comments = trim(top)
+
+        deleted = sum(1 for c in nodes.values()
+                      if c["author"] in (None, '[deleted]') or c["body"] in ('[deleted]', '[removed]'))
+        not_loaded = sum(s.get('count', 0) or 1 for s in stubs)
+        reasons = []
+        if stubs:
+            reasons.append(f"{len(stubs)} 'more' stubs with about {not_loaded} comments are not loaded"
+                           + (f": the cap of {MAX_THREAD_REQUESTS} requests was reached"
+                              if counter["requests"] >= MAX_THREAD_REQUESTS else ""))
+        reasons += errors
+        if waiting:
+            reasons.append(f"{len(waiting)} comments are not returned because their parent did not come back")
+        if returned < len(nodes):
+            reasons.append(f"cut to max_comments={max_comments} and depth={depth}: "
+                           f"{len(nodes) - returned} loaded comments are not returned")
+        if hidden:
+            reasons.append(f"{len(hidden)} comment ids from 'more' stubs did not come back after two "
+                           "requests: Reddit does not show them (removed or filtered)")
+        num = post["num_comments"] or 0
+        if len(nodes) < num:
+            reasons.append(f"num_comments={num} also counts comments that Reddit does not show, "
+                           f"so it can be higher than the {len(nodes)} loaded comments")
 
         return {
             "success": True,
             "post": post,
             "comments": comments,
+            "comments_info": {
+                "num_comments": post["num_comments"],
+                "loaded": len(nodes),
+                "returned": returned,
+                "deleted_or_removed": deleted,
+                "hidden_by_reddit": len(hidden),
+                "requests": counter["requests"],
+                "partial": bool(stubs or errors or waiting or returned < len(nodes)),
+                "notes": reasons,
+            },
+        }
+
+    def thread_search(self, url: str, query: str, author: Optional[str] = None,
+                      min_score: Optional[int] = None, max_results: int = 25,
+                      regex: bool = False) -> dict:
+        """Search the comments of one thread.
+
+        Loads the full comment tree once, then returns the comments whose body
+        matches the query (case-insensitive text, or a regular expression).
+
+        Args:
+            url: Post URL or ID
+            query: Text or regular expression to find in the comment body
+            author: Only comments of this author (case-insensitive)
+            min_score: Only comments with at least this score
+            max_results: Maximum matches to return
+            regex: Treat query as a regular expression
+
+        Returns:
+            Dict with the matches, each with the path of parent comment ids
+        """
+        try:
+            pattern = re.compile(query if regex else re.escape(query), re.IGNORECASE)
+        except re.error as e:
+            return {"success": False, "error": f"Invalid regex: {e}"}
+
+        result = self.read_post(url)
+        if not result.get("success"):
+            return result
+
+        matches = []
+        total = 0
+
+        def walk(comments, path):
+            nonlocal total
+            for c in comments:
+                body = c.get("body") or ""
+                m = pattern.search(body)
+                if (m and (author is None or (c.get("author") or "").lower() == author.lower())
+                        and (min_score is None or (c.get("score") or 0) >= min_score)):
+                    total += 1
+                    if len(matches) < max_results:
+                        start = max(m.start() - 80, 0)
+                        end = min(m.end() + 120, len(body))
+                        excerpt = ("…" if start else "") + body[start:end] + ("…" if end < len(body) else "")
+                        matches.append({
+                            "id": c["id"],
+                            "author": c["author"],
+                            "score": c["score"],
+                            "depth": c["depth"],
+                            "excerpt": excerpt,
+                            "path": path,
+                        })
+                walk(c["replies"], path + [c["id"]])
+
+        walk(result["comments"], [])
+
+        return {
+            "success": True,
+            "post": {k: result["post"][k] for k in ("id", "title", "permalink", "num_comments")},
+            "query": query,
+            "total_matches": total,
+            "matches": matches,
+            "comments_info": result["comments_info"],
         }
 
     def _get_rss(self, url: str) -> dict:
@@ -875,7 +1170,7 @@ def format_post(post: dict, comments: list, depth: int = 1) -> str:
         lines.append("")
 
     lines.append("-" * 79)
-    lines.append(f"COMMENTS (depth: {depth})")
+    lines.append(f"COMMENTS (depth: {depth or 'all'})")
     lines.append("-" * 79)
 
     def format_comments(comments: list, indent: int = 0):
@@ -884,7 +1179,7 @@ def format_post(post: dict, comments: list, depth: int = 1) -> str:
             marker = "▸" if indent == 0 else "↳"
             lines.append("")
             lines.append(f"{prefix}{marker} u/{c['author']} ({c['score']} pts) [{c['id']}]")
-            for body_line in c['body'].split('\n'):
+            for body_line in (c['body'] or '').split('\n'):
                 lines.append(f"{prefix}{body_line}")
             if c.get('replies'):
                 format_comments(c['replies'], indent + 1)
@@ -1055,8 +1350,8 @@ def main():
     # Read post
     read_parser = subparsers.add_parser("read", help="Read a post with comments")
     read_parser.add_argument("url", help="Post URL or ID")
-    read_parser.add_argument("--depth", type=int, default=1, help="Comment reply depth")
-    read_parser.add_argument("--max-comments", type=int, default=25, help="Max comments")
+    read_parser.add_argument("--depth", type=int, default=None, help="Comment reply depth (default: all)")
+    read_parser.add_argument("--max-comments", type=int, default=None, help="Max comments (default: all)")
     read_parser.add_argument("--json", action="store_true", help="Output JSON")
 
     # Listing
