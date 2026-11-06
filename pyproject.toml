@@ -19,11 +19,21 @@ classifiers = [
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Programming Language :: Python :: 3.15",
 ]
 requires-python = ">=3.10"
 dependencies = [
     "mcp>=1.0.0,<3",
     "httpx>=0.27.0",
+]
+
+[project.optional-dependencies]
+# Only `reddit auth` and the cookie refresh read browser cookies. browser_cookie3
+# needs lz4, which has no wheel for the newest Python, and a build of lz4 from
+# source fails without Microsoft Visual C++. The server does not need it.
+browser = [
     "browser_cookie3>=0.19.0",
 ]
 

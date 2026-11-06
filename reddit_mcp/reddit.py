@@ -1249,7 +1249,7 @@ def auth_from_browser(browser: str = None) -> dict:
     try:
         import browser_cookie3
     except ImportError:
-        return {"success": False, "error": "browser_cookie3 not installed. Run: pip install browser_cookie3"}
+        return {"success": False, "error": "browser_cookie3 not installed. Run: pip install \"reddit-mcp-noapi[browser]\""}
 
     # Snap/Flatpak alternate paths for Chrome-based browsers
     home = Path.home()

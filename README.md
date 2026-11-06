@@ -70,6 +70,8 @@ reddit auth --browser chrome
 
 This extracts the `reddit_session` cookie and saves it to `~/.config/reddit-mcp/session.json`.
 
+`reddit auth` and the automatic refresh need the `browser` extra: `pip install "reddit-mcp-noapi[browser]"`. The MCP server itself does not need it.
+
 **Supported browsers:**
 
 | Browser | Linux | macOS | Windows |
