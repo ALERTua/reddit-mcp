@@ -12,6 +12,8 @@ import os
 import re
 import sys
 import time
+import xml.etree.ElementTree as ET
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 from urllib.parse import urlencode
@@ -238,6 +240,44 @@ class RedditClient:
             "comments": comments,
         }
 
+    def _get_rss(self, url: str) -> dict:
+        """Read a Reddit Atom feed and return its posts in the listing shape."""
+        resp = self.session.get(url)
+        if resp.status_code != 200:
+            return {"success": False, "error": f"HTTP {resp.status_code}"}
+
+        try:
+            root = ET.fromstring(resp.text)
+        except ET.ParseError:
+            return {"success": False, "error": "Invalid RSS response"}
+
+        ns = {"a": "http://www.w3.org/2005/Atom"}
+        posts = []
+        for entry in root.findall("a:entry", ns):
+            author = (entry.findtext("a:author/a:name", default="", namespaces=ns) or "").removeprefix("/u/")
+            link = entry.find("a:link", ns)
+            permalink = re.sub(r"^https?://[^/]+", "", link.get("href", "")) if link is not None else None
+            created = None
+            updated = entry.findtext("a:updated", namespaces=ns)
+            if updated:
+                try:
+                    created = datetime.fromisoformat(updated).timestamp()
+                except ValueError:
+                    pass
+            posts.append({
+                "id": entry.findtext("a:id", namespaces=ns),
+                "title": entry.findtext("a:title", namespaces=ns),
+                "author": author,
+                "score": None,
+                "num_comments": None,
+                "created_utc": created,
+                "permalink": permalink,
+                "url": None,
+                "is_self": None,
+                "stickied": None,
+            })
+        return {"success": True, "posts": posts}
+
     def read_listing(self, subreddit: str, limit: int = 15, skip: int = 0,
                      sort: str = "hot") -> dict:
         """Read posts from a subreddit.
@@ -256,6 +296,16 @@ class RedditClient:
 
         self._ensure_logged_in()
         resp = self.session.get(url)
+        if resp.status_code == 403:
+            # Reddit blocks the .json listings but still serves the Atom feed.
+            rss = self._get_rss(f"{BASE_URL}/r/{subreddit}/{sort}.rss?limit={fetch_count}")
+            if rss.get("success"):
+                return {
+                    "success": True,
+                    "subreddit": subreddit,
+                    "posts": rss["posts"][skip:skip + limit],
+                    "note": "From the RSS feed: score and num_comments are not available.",
+                }
         if resp.status_code != 200:
             return {"success": False, "error": f"HTTP {resp.status_code}"}
 
@@ -317,6 +367,17 @@ class RedditClient:
 
         self._ensure_logged_in()
         resp = self.session.get(url)
+        if resp.status_code == 403:
+            # Reddit blocks the .json search but still serves the Atom feed.
+            rss = self._get_rss(f"{BASE_URL}/r/{subreddit}/search.rss?{urlencode(params)}")
+            if rss.get("success"):
+                return {
+                    "success": True,
+                    "subreddit": subreddit,
+                    "query": query,
+                    "posts": rss["posts"][:limit],
+                    "note": "From the RSS feed: score and num_comments are not available.",
+                }
         if resp.status_code != 200:
             return {"success": False, "error": f"HTTP {resp.status_code}"}
 
