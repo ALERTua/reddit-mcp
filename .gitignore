@@ -9,3 +9,5 @@ build/
 .env
 credentials.json
 session.json
+.claude/*
+!.claude/memory/
