@@ -22,11 +22,20 @@ logger = logging.getLogger("reddit-mcp")
 client = RedditClient()
 
 
+# Annotations tell an MCP client what a tool can change on Reddit.
+# They are plain dictionaries, because mcp 1.0 has no ToolAnnotations class.
+_READ_ONLY = {"readOnlyHint": True, "openWorldHint": True}
+_WRITE = {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": True}
+_VOTE = {**_WRITE, "idempotentHint": True}
+_DELETE = {"readOnlyHint": False, "destructiveHint": True, "idempotentHint": True, "openWorldHint": True}
+
+
 async def list_tools() -> list[Tool]:
     """List available Reddit tools."""
     return [
         Tool(
             name="reddit_read",
+            annotations=_READ_ONLY,
             description=(
                 "Read a Reddit post with its full comment tree. Returns post content, metadata, "
                 "threaded comments, and comments_info, which tells if the tree is partial and why."
@@ -52,6 +61,7 @@ async def list_tools() -> list[Tool]:
         ),
         Tool(
             name="reddit_thread_search",
+            annotations=_READ_ONLY,
             description=(
                 "Search the comments of one Reddit thread. Loads the full comment tree once and returns "
                 "the matching comments with their id, author, score, depth, an excerpt, and the path of parent ids."
@@ -91,6 +101,7 @@ async def list_tools() -> list[Tool]:
         ),
         Tool(
             name="reddit_listing",
+            annotations=_READ_ONLY,
             description="List posts from a subreddit. Returns titles, scores, and permalinks.",
             inputSchema={
                 "type": "object",
@@ -121,6 +132,7 @@ async def list_tools() -> list[Tool]:
         ),
         Tool(
             name="reddit_search",
+            annotations=_READ_ONLY,
             description="Search for posts within a subreddit.",
             inputSchema={
                 "type": "object",
@@ -154,6 +166,7 @@ async def list_tools() -> list[Tool]:
         ),
         Tool(
             name="reddit_inbox",
+            annotations=_READ_ONLY,
             description="Check Reddit inbox for replies, mentions, and messages. Requires authentication.",
             inputSchema={
                 "type": "object",
@@ -173,6 +186,7 @@ async def list_tools() -> list[Tool]:
         ),
         Tool(
             name="reddit_comment",
+            annotations=_WRITE,
             description="Post a comment reply. Requires authentication.",
             inputSchema={
                 "type": "object",
@@ -196,6 +210,7 @@ async def list_tools() -> list[Tool]:
         ),
         Tool(
             name="reddit_submit",
+            annotations=_WRITE,
             description="Submit a new post to a subreddit. Requires authentication.",
             inputSchema={
                 "type": "object",
@@ -230,6 +245,7 @@ async def list_tools() -> list[Tool]:
         ),
         Tool(
             name="reddit_vote",
+            annotations=_VOTE,
             description="Vote on a post or comment. Requires authentication.",
             inputSchema={
                 "type": "object",
@@ -249,6 +265,7 @@ async def list_tools() -> list[Tool]:
         ),
         Tool(
             name="reddit_delete",
+            annotations=_DELETE,
             description="Delete your own post or comment. Requires authentication.",
             inputSchema={
                 "type": "object",
