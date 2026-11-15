@@ -15,6 +15,7 @@ metadata:
 
 - The server supports `mcp` 1.x and 2.x, so the range is `mcp>=1.0.0,<3`.
 - mcp 2.x has no `Server.list_tools` and no `Server.call_tool` decorator. For 2.x, `server.py` gives `on_list_tools` and `on_call_tool` to `Server(...)`. On 2.x, `serverInfo.version` of the `initialize` answer is empty.
+- The `annotations` of each tool in `server.py` are plain dictionaries. mcp 1.0 has no `ToolAnnotations` class, so an import of that class breaks the lower end of the range. A proxy such as mcpproxy routes a tool by these hints, so give each new tool its annotations.
 - Do not tell users to pin `mcp<2` in a launcher command. On Windows, a launcher that runs the command through `cmd /c`, for example mcpproxy, breaks an argument with `<`.
 - After a change of the `mcp` API use, start the server on 1.x and on 2.x. `uvx --with "mcp>=1,<2" --from . reddit-mcp` gives 1.x, and `uvx --from . reddit-mcp` gives the newest 2.x.
 

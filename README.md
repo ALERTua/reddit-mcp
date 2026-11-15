@@ -157,6 +157,8 @@ Reddit session cookies last a long time (months), so refreshes are rare. If auto
 | `reddit_vote` | Upvote/downvote |
 | `reddit_delete` | Delete your own content |
 
+Each tool declares MCP annotations, so a client or a proxy can tell the tools apart. The read tools and `reddit_inbox` set `readOnlyHint: true`. `reddit_comment`, `reddit_submit` and `reddit_vote` set `readOnlyHint: false`. `reddit_delete` also sets `destructiveHint: true`.
+
 ### CLI Examples (Write Mode)
 
 ```bash
