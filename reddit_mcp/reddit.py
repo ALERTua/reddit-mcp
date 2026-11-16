@@ -573,6 +573,42 @@ class RedditClient:
             })
         return {"success": True, "posts": posts}
 
+    def _get_search_html(self, url: str) -> dict:
+        """Read an old.reddit.com HTML search page and return its posts in the listing shape.
+
+        Each post of the page is a div with the class "search-result-link" and a
+        data-fullname="t3_..." attribute. The page has no post URL and no is_self flag,
+        so these fields are None.
+        """
+        resp = self.session.get(url)
+        if resp.status_code != 200:
+            return {"success": False, "error": f"HTTP {resp.status_code}"}
+
+        posts = []
+        blocks = re.split(r'<div class="[^"]*\bsearch-result-link\b[^"]*"\s', resp.text)[1:]
+        for block in blocks:
+            fullname = re.match(r'data-fullname="(t3_[a-z0-9]+)"', block)
+            if not fullname:
+                continue
+            title = re.search(r'<a href="([^"]*)" class="search-title[^"]*"[^>]*>(.*?)</a>', block, re.S)
+            score = re.search(r'class="search-score">(-?[\d,]+) points?<', block)
+            comments = re.search(r'class="search-comments[^"]*"[^>]*>([\d,]+) comments?<', block)
+            created = re.search(r'<time[^>]* datetime="([^"]+)"', block)
+            author = re.search(r'class="author[^"]*"[^>]*>([^<]+)</a>', block)
+            posts.append({
+                "id": fullname.group(1),
+                "title": html.unescape(re.sub(r"<[^>]+>", "", title.group(2))).strip() if title else None,
+                "author": author.group(1) if author else "[deleted]",
+                "score": int(score.group(1).replace(",", "")) if score else None,
+                "num_comments": int(comments.group(1).replace(",", "")) if comments else 0,
+                "created_utc": datetime.fromisoformat(created.group(1)).timestamp() if created else None,
+                "permalink": re.sub(r"^https?://[^/]+", "", title.group(1)) if title else None,
+                "url": None,
+                "is_self": None,
+                "stickied": None,
+            })
+        return {"success": True, "posts": posts}
+
     def read_listing(self, subreddit: str, limit: int = 15, skip: int = 0,
                      sort: str = "hot") -> dict:
         """Read posts from a subreddit.
@@ -663,7 +699,17 @@ class RedditClient:
         self._ensure_logged_in()
         resp = self.session.get(url)
         if resp.status_code == 403:
-            # Reddit blocks the .json search but still serves the Atom feed.
+            # Reddit blocks the .json search for a logged-in session, and also its
+            # Atom feed, but still serves the HTML search page of old.reddit.com.
+            page = self._get_search_html(f"{BASE_URL}/r/{subreddit}/search?{urlencode(params)}")
+            if page.get("success"):
+                return {
+                    "success": True,
+                    "subreddit": subreddit,
+                    "query": query,
+                    "posts": page["posts"][:limit],
+                    "note": "From the HTML search page: url and is_self are not available.",
+                }
             rss = self._get_rss(f"{BASE_URL}/r/{subreddit}/search.rss?{urlencode(params)}")
             if rss.get("success"):
                 return {
@@ -673,6 +719,9 @@ class RedditClient:
                     "posts": rss["posts"][:limit],
                     "note": "From the RSS feed: score and num_comments are not available.",
                 }
+            return {"success": False,
+                    "error": f"HTTP 403 on search.json, {page['error']} on the HTML search page, "
+                             f"{rss['error']} on search.rss"}
         if resp.status_code != 200:
             return {"success": False, "error": f"HTTP {resp.status_code}"}
 
